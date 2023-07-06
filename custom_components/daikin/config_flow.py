@@ -1,99 +1,147 @@
-"""Config flow to configure qnap component."""
-from __future__ import annotations
-
+"""Config flow for the Daikin platform."""
+import asyncio
 import logging
-from typing import Any
+from uuid import uuid4
 
-from qnapstats import QNAPStats
-from requests.exceptions import ConnectTimeout
+from aiohttp import ClientError, web_exceptions
+from async_timeout import timeout
+from pydaikin.daikin_base import Appliance, DaikinException
+from pydaikin.discovery import Discovery
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.const import (
-    CONF_HOST,
-    CONF_MONITORED_CONDITIONS,
-    CONF_PASSWORD,
-    CONF_PORT,
-    CONF_SSL,
-    CONF_USERNAME,
-    CONF_VERIFY_SSL,
-)
+from homeassistant.components import zeroconf
+from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_PASSWORD, CONF_UUID
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import (
-    CONF_DRIVES,
-    CONF_NICS,
-    CONF_VOLUMES,
-    DEFAULT_PORT,
-    DEFAULT_SSL,
-    DEFAULT_TIMEOUT,
-    DEFAULT_VERIFY_SSL,
-    DOMAIN,
-)
-
-DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Required(CONF_USERNAME): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-        vol.Optional(CONF_SSL, default=DEFAULT_SSL): cv.boolean,
-        vol.Optional(CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL): cv.boolean,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-    }
-)
+from .const import DOMAIN, KEY_MAC, TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class QnapConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Qnap configuration flow."""
+class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+    """Handle a config flow."""
 
     VERSION = 1
 
-    async def async_step_import(self, import_info: dict[str, Any]) -> FlowResult:
-        """Set the config entry up from yaml."""
-        import_info.pop(CONF_MONITORED_CONDITIONS, None)
-        import_info.pop(CONF_NICS, None)
-        import_info.pop(CONF_DRIVES, None)
-        import_info.pop(CONF_VOLUMES, None)
-        return await self.async_step_user(import_info)
+    def __init__(self):
+        """Initialize the Daikin config flow."""
+        self.host = None
 
-    async def async_step_user(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> FlowResult:
-        """Handle a flow initialized by the user."""
-        errors = {}
-        if user_input is not None:
-            host = user_input[CONF_HOST]
-            protocol = "https" if user_input[CONF_SSL] else "http"
-            api = QNAPStats(
-                host=f"{protocol}://{host}",
-                port=user_input[CONF_PORT],
-                username=user_input[CONF_USERNAME],
-                password=user_input[CONF_PASSWORD],
-                verify_ssl=user_input[CONF_VERIFY_SSL],
-                timeout=DEFAULT_TIMEOUT,
-            )
-            try:
-                stats = await self.hass.async_add_executor_job(api.get_system_stats)
-            except ConnectTimeout:
-                errors["base"] = "cannot_connect"
-            except TypeError:
-                errors["base"] = "invalid_auth"
-            except Exception as error:  # pylint: disable=broad-except
-                _LOGGER.error(error)
-                errors["base"] = "unknown"
-            else:
-                unique_id = stats["system"]["serial_number"]
-                await self.async_set_unique_id(unique_id)
-                self._abort_if_unique_id_configured()
-                title = stats["system"]["name"]
-                return self.async_create_entry(title=title, data=user_input)
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=self.add_suggested_values_to_schema(DATA_SCHEMA, user_input),
-            errors=errors,
+    @property
+    def schema(self):
+        """Return current schema."""
+        return vol.Schema(
+            {
+                vol.Required(CONF_HOST, default=self.host): str,
+                vol.Optional(CONF_API_KEY): str,
+                vol.Optional(CONF_PASSWORD): str,
+            }
         )
+
+    async def _create_entry(self, host, mac, key=None, uuid=None, password=None):
+        """Register new entry."""
+        if not self.unique_id:
+            await self.async_set_unique_id(mac)
+        self._abort_if_unique_id_configured()
+
+        return self.async_create_entry(
+            title=host,
+            data={
+                CONF_HOST: host,
+                KEY_MAC: mac,
+                CONF_API_KEY: key,
+                CONF_UUID: uuid,
+                CONF_PASSWORD: password,
+            },
+        )
+
+    async def _create_device(self, host, key=None, password=None):
+        """Create device."""
+        # BRP07Cxx devices needs uuid together with key
+        if key:
+            uuid = str(uuid4())
+        else:
+            uuid = None
+            key = None
+
+        if not password:
+            password = None
+
+        try:
+            async with timeout(TIMEOUT):
+                device = await Appliance.factory(
+                    host,
+                    async_get_clientsession(self.hass),
+                    key=key,
+                    uuid=uuid,
+                    password=password,
+                )
+        except (asyncio.TimeoutError, ClientError):
+            self.host = None
+            return self.async_show_form(
+                step_id="user",
+                data_schema=self.schema,
+                errors={"base": "cannot_connect"},
+            )
+        except web_exceptions.HTTPForbidden:
+            return self.async_show_form(
+                step_id="user",
+                data_schema=self.schema,
+                errors={"base": "invalid_auth"},
+            )
+        except DaikinException as daikin_exp:
+            _LOGGER.error(daikin_exp)
+            return self.async_show_form(
+                step_id="user",
+                data_schema=self.schema,
+                errors={"base": "unknown"},
+            )
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception("Unexpected error creating device")
+            return self.async_show_form(
+                step_id="user",
+                data_schema=self.schema,
+                errors={"base": "unknown"},
+            )
+
+        mac = device.mac
+        return await self._create_entry(host, mac, key, uuid, password)
+
+    async def async_step_user(self, user_input=None):
+        """User initiated config flow."""
+        if user_input is None:
+            return self.async_show_form(step_id="user", data_schema=self.schema)
+        if user_input.get(CONF_API_KEY) and user_input.get(CONF_PASSWORD):
+            self.host = user_input.get(CONF_HOST)
+            return self.async_show_form(
+                step_id="user",
+                data_schema=self.schema,
+                errors={"base": "api_password"},
+            )
+        return await self._create_device(
+            user_input[CONF_HOST],
+            user_input.get(CONF_API_KEY),
+            user_input.get(CONF_PASSWORD),
+        )
+
+    async def async_step_zeroconf(
+        self, discovery_info: zeroconf.ZeroconfServiceInfo
+    ) -> FlowResult:
+        """Prepare configuration for a discovered Daikin device."""
+        _LOGGER.debug("Zeroconf user_input: %s", discovery_info)
+        devices = Discovery().poll(ip=discovery_info.host)
+        if not devices:
+            _LOGGER.debug(
+                (
+                    "Could not find MAC-address for %s, make sure the required UDP"
+                    " ports are open (see integration documentation)"
+                ),
+                discovery_info.host,
+            )
+            return self.async_abort(reason="cannot_connect")
+        await self.async_set_unique_id(next(iter(devices))[KEY_MAC])
+        self._abort_if_unique_id_configured()
+        self.host = discovery_info.host
+        return await self.async_step_user()
