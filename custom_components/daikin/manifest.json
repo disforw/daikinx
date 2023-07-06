@@ -8,5 +8,6 @@
   "loggers": ["pydaikin"],
   "quality_scale": "platinum",
   "requirements": ["pydaikin==2.10.5"],
-  "zeroconf": ["_dkapi._tcp.local."]
+  "zeroconf": ["_dkapi._tcp.local."],
+  "version": 9.0
 }
